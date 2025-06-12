@@ -1,5 +1,7 @@
 data/
 DATABASE/
+runs/
+runs_regnety160/
 
 # Ignore Python bytecode files
 __pycache__/
