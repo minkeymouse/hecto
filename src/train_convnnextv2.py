@@ -156,10 +156,8 @@ tf_good_s1 = tf_default_s1 = create_transform(
     is_training=True,
     interpolation=_conf["interpolation"],
     mean=_mean, std=_std,
-    hflip=0.5,     # keep horizontal flip
-    vflip=0.0,     # <-- ensure vertical flip is OFF
-    # you may tune RandAug strength:
-    # rand_augment_kwargs=dict(magnitude=7, magnitude_std=1),
+    hflip=0.5,    
+    vflip=0.0,    
 )
 
 tf_good_s2 = tf_default_s2 = create_transform(
