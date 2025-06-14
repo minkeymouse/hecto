@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 import pandas as pd
 import timm
 from timm.data import resolve_model_data_config, create_transform
@@ -14,6 +14,7 @@ from torchvision import transforms
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
 from torch.amp import autocast
+import numpy as np
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 TEST_DIR    = Path("/data/hecto/test")
@@ -22,8 +23,7 @@ SAMPLE_CSV  = Path("/data/hecto/sample_submission.csv")
 OUTPUT_CSV  = Path("submission_convnext.csv")
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# On a 16GB GPU using 4 TTA views, start with batch size ~8
-BATCH_SIZE  = 24
+BATCH_SIZE  = 12
 NUM_WORKERS = 4
 MODEL_NAME  = "convnextv2_large.fcmae_ft_in22k_in1k_384"
 
@@ -61,6 +61,29 @@ def build_tta_transforms(dc):
     tta_list.append(transforms.Compose([
         transforms.Lambda(lambda x: zoom_out(x, 0.8)), normalize
     ]))
+
+    # Additional augmentations
+    tta_list.append(transforms.Compose([
+        transforms.Resize(size),
+        transforms.CenterCrop(size),
+        transforms.Lambda(lambda img: img.filter(ImageFilter.SHARPEN)),
+        normalize
+    ]))
+
+    tta_list.append(transforms.Compose([
+        transforms.Resize(size),
+        transforms.CenterCrop(size),
+        transforms.Lambda(ImageOps.autocontrast),
+        normalize
+    ]))
+
+    tta_list.append(transforms.Compose([
+        transforms.Resize(size),
+        transforms.CenterCrop(size),
+        transforms.Lambda(ImageOps.equalize),
+        normalize
+    ]))
+
     return tta_list
 
 # ─── DATASET ───────────────────────────────────────────────────────────────
@@ -118,15 +141,51 @@ def main():
     for ckpt in ckpts:
         print(f"Loading {ckpt.name}...")
         model = load_model(ckpt, MODEL_NAME, ckpt_classes)
+
+        # ——— Test-time BN adaptation ———
+        # 1) Switch BN to train mode, but freeze all weights
+        model.train()
+        for p in model.parameters():
+            p.requires_grad = False
+        for m in model.modules():
+            # ensure dropout stays off
+            if isinstance(m, torch.nn.Dropout): m.eval()
+
+        # 2) Run one pass through your loader (no grad) to update running stats
+        with torch.no_grad():
+            for views, _ in dl:
+                # just need one batch or two; you can break early if you want
+                b, t, c, h, w = views.shape
+                x = views.view(b*t, c, h, w).to(DEVICE)
+                _ = model(x)
+                break
+
+        # 3) Freeze BN stats and go back to eval mode
+        for m in model.modules():
+            if isinstance(m, torch.nn.BatchNorm2d):
+                m.eval()
+
+        # ——— now proceed with your usual MC-Dropout or TTA inference ———
+
+        model.eval()
+        for m in model.modules():
+            if isinstance(m, torch.nn.Dropout):
+                m.train()
+
         idx = 0
-        # track per-fold progress
+        # do K stochastic passes per view
+        K = 5
         for views, _ in tqdm(dl, desc=f"Fold {ckpt.name}"):
             b, t, c, h, w = views.shape
             # effective batch = BATCH_SIZE * n_views
             x = views.view(b*t, c, h, w).to(DEVICE)
-            with torch.no_grad(), autocast(device_type='cuda', enabled=True):
-                logits = model(x)
-                probs = F.softmax(logits, dim=1)
+            # accumulate MC‐Dropout samples
+            mc_probs = 0
+            with autocast(device_type='cuda', enabled=True):
+                for _ in range(K):
+                    logits = model(x)
+                    mc_probs = mc_probs + F.softmax(logits, dim=1)
+            probs = mc_probs / K
             # average over TTA
             probs = probs.view(b, t, -1).mean(dim=1)
             preds[idx:idx+b] += probs
@@ -136,6 +195,16 @@ def main():
     # average across folds
     preds /= len(ckpts)
     arr = preds.cpu().numpy()
+
+    # ─── minimal uniform-prior smoothing ──────────────────────────────
+    epsilon = 1e-3
+    n_classes = arr.shape[1]
+    arr = arr * (1 - epsilon) + (epsilon / n_classes)
+
+    # sharpen probabilities
+    T = 0.9  # try in [0.8, 1.0)
+    arr = np.power(arr, 1.0 / T)
+    arr = arr / arr.sum(axis=1, keepdims=True)
 
     # fill submission
     df.iloc[:,1:] = arr
