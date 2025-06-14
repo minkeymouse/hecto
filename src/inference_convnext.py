@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# inference_convnextv2_two_stage.py
-# Ensemble inference with two-stage fine-tuned ConvNeXt-V2 and TTA, with progress tracking
+# inference_convnextv2_two_stage_multiscale.py
+# Ensemble inference with multi-scale TTA + two-stage fine-tuned ConvNeXt-V2
 
 from pathlib import Path
 import torch
@@ -9,25 +9,40 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image, ImageOps, ImageFilter
 import pandas as pd
 import timm
-from timm.data import resolve_model_data_config, create_transform
+from timm.data import resolve_model_data_config
 from torchvision import transforms
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
-from torch.amp import autocast
+from torch.amp.autocast_mode import autocast
 import numpy as np
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 TEST_DIR    = Path("/data/hecto/test")
 MODELS_DIR  = Path("./models")
 SAMPLE_CSV  = Path("/data/hecto/sample_submission.csv")
-OUTPUT_CSV  = Path("submission_convnext.csv")
+OUTPUT_CSV  = Path("submission_convnext_multiscale.csv")
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-BATCH_SIZE  = 12
+BATCH_SIZE  = 8
 NUM_WORKERS = 4
 MODEL_NAME  = "convnextv2_large.fcmae_ft_in22k_in1k_384"
 
-# ─── BUILD TTA TRANSFORMS (no crop ops) ────────────────────────────────────
+# scales and their blending weights
+SCALES = [
+    (320,  0.08),
+    (352,  0.08),
+    (384,  0.40),
+    (416,  0.12),  # new mid-point
+    (448,  0.20),
+    (480,  0.12),  # another mid-point
+]
+
+# global placeholders filled in main()
+paths = None
+ckpts = None
+n_classes = None
+
+# ─── BUILD TTA TRANSFORMS ─────────────────────────────────────────────────
 def build_tta_transforms(dc):
     size = dc['input_size'][-1]
     mean, std = dc['mean'], dc['std']
@@ -43,47 +58,33 @@ def build_tta_transforms(dc):
         return TF.center_crop(img2, size)
 
     tta_list = []
-    # original
+    # center
     tta_list.append(transforms.Compose([
-        transforms.Resize(int(size * dc['crop_pct'])),
-        transforms.CenterCrop(size), normalize
+        transforms.Resize(size),
+        transforms.CenterCrop(size),
+        normalize
     ]))
     # horizontal flip
     tta_list.append(transforms.Compose([
-        transforms.Resize(int(size * dc['crop_pct'])),
-        transforms.CenterCrop(size),
-        transforms.Lambda(lambda x: TF.hflip(x)), normalize
+        transforms.Resize(size), transforms.CenterCrop(size),
+        transforms.Lambda(TF.hflip), normalize
     ]))
     # zoom outs
+    tta_list.append(transforms.Compose([transforms.Lambda(lambda x: zoom_out(x, 0.9)), normalize]))
+    tta_list.append(transforms.Compose([transforms.Lambda(lambda x: zoom_out(x, 0.8)), normalize]))
+    # sharpen, autocontrast, equalize
     tta_list.append(transforms.Compose([
-        transforms.Lambda(lambda x: zoom_out(x, 0.9)), normalize
+        transforms.Resize(size), transforms.CenterCrop(size),
+        transforms.Lambda(lambda img: img.filter(ImageFilter.SHARPEN)), normalize
     ]))
     tta_list.append(transforms.Compose([
-        transforms.Lambda(lambda x: zoom_out(x, 0.8)), normalize
+        transforms.Resize(size), transforms.CenterCrop(size),
+        transforms.Lambda(ImageOps.autocontrast), normalize
     ]))
-
-    # Additional augmentations
     tta_list.append(transforms.Compose([
-        transforms.Resize(size),
-        transforms.CenterCrop(size),
-        transforms.Lambda(lambda img: img.filter(ImageFilter.SHARPEN)),
-        normalize
+        transforms.Resize(size), transforms.CenterCrop(size),
+        transforms.Lambda(ImageOps.equalize), normalize
     ]))
-
-    tta_list.append(transforms.Compose([
-        transforms.Resize(size),
-        transforms.CenterCrop(size),
-        transforms.Lambda(ImageOps.autocontrast),
-        normalize
-    ]))
-
-    tta_list.append(transforms.Compose([
-        transforms.Resize(size),
-        transforms.CenterCrop(size),
-        transforms.Lambda(ImageOps.equalize),
-        normalize
-    ]))
-
     return tta_list
 
 # ─── DATASET ───────────────────────────────────────────────────────────────
@@ -105,110 +106,73 @@ def load_model(ckpt_file, model_name, num_classes):
     model.load_state_dict(state)
     return model.to(DEVICE).eval()
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────
-def main():
-    # read submission template
-    df = pd.read_csv(SAMPLE_CSV)
-    img_ids = df.iloc[:,0].astype(str)
-    paths = [TEST_DIR/f"{i}.jpg" for i in img_ids]
-    n_classes = df.shape[1] - 1
-
-    # setup TTA
-    dummy = timm.create_model(MODEL_NAME, pretrained=False)
-    dc = resolve_model_data_config(dummy)
+# ─── MULTI-SCALE INFERENCE ─────────────────────────────────────────────────
+def infer_for_dc(dc):
     tta_transforms = build_tta_transforms(dc)
-    n_views = len(tta_transforms)
-
-    # dataset & loader
     ds = TestDataset(paths, tta_transforms)
     dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False,
                     num_workers=NUM_WORKERS, pin_memory=True)
 
-    # infer class count from checkpoint head
-    ckpt0 = MODELS_DIR / "convnext_fold0.pth"
-    if not ckpt0.exists(): raise FileNotFoundError(ckpt0)
-    state0 = torch.load(ckpt0, map_location="cpu")
-    head_key = next(k for k in state0 if k.endswith("head.fc.weight"))
-    ckpt_classes = state0[head_key].shape[0]
-    if ckpt_classes != n_classes:
-        raise ValueError(f"Checkpoint classes={ckpt_classes} vs CSV classes={n_classes}")
-
     preds = torch.zeros(len(ds), n_classes, device=DEVICE)
-    ckpts = sorted(MODELS_DIR.glob("convnext_fold*.pth"))
-    if not ckpts: raise FileNotFoundError(MODELS_DIR)
-
-    # loop folds
     for ckpt in ckpts:
-        print(f"Loading {ckpt.name}...")
-        model = load_model(ckpt, MODEL_NAME, ckpt_classes)
-
-        # ——— Test-time BN adaptation ———
-        # 1) Switch BN to train mode, but freeze all weights
-        model.train()
-        for p in model.parameters():
-            p.requires_grad = False
-        for m in model.modules():
-            # ensure dropout stays off
-            if isinstance(m, torch.nn.Dropout): m.eval()
-
-        # 2) Run one pass through your loader (no grad) to update running stats
-        with torch.no_grad():
-            for views, _ in dl:
-                # just need one batch or two; you can break early if you want
-                b, t, c, h, w = views.shape
-                x = views.view(b*t, c, h, w).to(DEVICE)
-                _ = model(x)
-                break
-
-        # 3) Freeze BN stats and go back to eval mode
-        for m in model.modules():
-            if isinstance(m, torch.nn.BatchNorm2d):
-                m.eval()
-
-        # ——— now proceed with your usual MC-Dropout or TTA inference ———
-
+        model = load_model(ckpt, MODEL_NAME, n_classes)
         model.eval()
-        for m in model.modules():
-            if isinstance(m, torch.nn.Dropout):
-                m.train()
-
         idx = 0
-        # do K stochastic passes per view
-        K = 5
-        for views, _ in tqdm(dl, desc=f"Fold {ckpt.name}"):
+        for views, _ in tqdm(dl, desc=f"{dc['input_size'][-1]}px:{ckpt.name}"):
             b, t, c, h, w = views.shape
-            # effective batch = BATCH_SIZE * n_views
             x = views.view(b*t, c, h, w).to(DEVICE)
-            # accumulate MC‐Dropout samples
-            mc_probs = 0
-            with autocast(device_type='cuda', enabled=True):
-                for _ in range(K):
-                    logits = model(x)
-                    mc_probs = mc_probs + F.softmax(logits, dim=1)
-            probs = mc_probs / K
-            # average over TTA
+            with torch.no_grad(), autocast(device_type='cuda', enabled=True):
+                logits = model(x)
+                probs  = F.softmax(logits, dim=1)
             probs = probs.view(b, t, -1).mean(dim=1)
             preds[idx:idx+b] += probs
             idx += b
         torch.cuda.empty_cache()
-
-    # average across folds
     preds /= len(ckpts)
-    arr = preds.cpu().numpy()
+    return preds.cpu().numpy()
 
-    # ─── minimal uniform-prior smoothing ──────────────────────────────
-    epsilon = 1e-3
-    n_classes = arr.shape[1]
-    arr = arr * (1 - epsilon) + (epsilon / n_classes)
+# ─── MAIN ─────────────────────────────────────────────────────────────────
+def main():
+    global paths, ckpts, n_classes
 
-    # sharpen probabilities
-    T = 0.9  # try in [0.8, 1.0)
+    # load submission template and paths
+    df       = pd.read_csv(SAMPLE_CSV)
+    img_ids  = df.iloc[:,0].astype(str)
+    paths    = [TEST_DIR/f"{i}.jpg" for i in img_ids]
+    n_classes = df.shape[1] - 1
+
+    # prepare checkpoints
+    ckpts = sorted(MODELS_DIR.glob("convnext_fold*.pth"))
+    if not ckpts:
+        raise FileNotFoundError(f"No checkpoints in {MODELS_DIR}")
+
+    # base config for default scale
+    dummy = timm.create_model(MODEL_NAME, pretrained=False)
+    dc_base = resolve_model_data_config(dummy)
+
+    # run multi-scale inference
+    combined = None
+    for size, weight in SCALES:
+        dc_i = dict(dc_base)
+        dc_i['input_size'] = (3, size, size)
+        dc_i['crop_pct']   = size / dc_base['input_size'][-1]
+        print(f"Running inference at {size}x{size} (weight {weight})")
+        preds_i = infer_for_dc(dc_i)
+        arr_i = weight * preds_i
+        combined = arr_i if combined is None else combined + arr_i
+
+    arr = combined
+    # uniform-prior smoothing
+    eps = 1e-3
+    arr = arr * (1 - eps) + (eps / n_classes)
+    # temperature sharpening
+    T = 0.9
     arr = np.power(arr, 1.0 / T)
     arr = arr / arr.sum(axis=1, keepdims=True)
 
-    # fill submission
     df.iloc[:,1:] = arr
     df.to_csv(OUTPUT_CSV, index=False)
-    print(f"Saved ensemble to {OUTPUT_CSV}")
+    print(f"Saved multi-scale ensemble to {OUTPUT_CSV}")
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
