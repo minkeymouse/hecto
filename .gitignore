@@ -3,6 +3,7 @@ DATABASE/
 runs/
 runs_regnety160/
 models/
+meta_data/
 
 # Ignore Python bytecode files
 __pycache__/
