@@ -32,9 +32,9 @@ SCALES = [
     (320,  0.08),
     (352,  0.08),
     (384,  0.40),
-    (416,  0.12),  # new mid-point
+    (416,  0.12),  
     (448,  0.20),
-    (480,  0.12),  # another mid-point
+    (480,  0.12),
 ]
 
 # global placeholders filled in main()
@@ -142,7 +142,7 @@ def main():
     n_classes = df.shape[1] - 1
 
     # prepare checkpoints
-    ckpts = sorted(MODELS_DIR.glob("convnext_fold*.pth"))
+    ckpts = sorted(MODELS_DIR.glob("convnext_stage2_fold*.pth"))
     if not ckpts:
         raise FileNotFoundError(f"No checkpoints in {MODELS_DIR}")
 
